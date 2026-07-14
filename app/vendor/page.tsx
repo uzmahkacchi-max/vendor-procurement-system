@@ -18,6 +18,15 @@ type Bid = {
   bid_price: number;
 };
 
+// Single source of truth for "is this auction still live".
+// Use this everywhere instead of checking ends_at (or status) alone.
+function isAuctionActive(rfq: RFQ): boolean {
+  return (
+    rfq.status === "active" &&
+    new Date(rfq.ends_at).getTime() > Date.now()
+  );
+}
+
 export default function VendorDashboard() {
   const [rfqs, setRfqs] = useState<RFQ[]>([]);
   const [vendorNames, setVendorNames] = useState<Record<string, string>>({});
@@ -34,7 +43,7 @@ export default function VendorDashboard() {
       setTick((t) => t + 1);
     }, 1000);
 
-    const channel = supabase
+    const bidsChannel = supabase
       .channel("bids-changes")
       .on(
         "postgres_changes",
@@ -45,9 +54,24 @@ export default function VendorDashboard() {
       )
       .subscribe();
 
+    // Also subscribe to RFQ changes so that if the buyer manually closes
+    // (or edits/deletes) an auction, every vendor dashboard picks it up
+    // immediately instead of waiting for a manual refresh.
+    const rfqsChannel = supabase
+      .channel("rfqs-changes")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "rfqs" },
+        () => {
+          fetchRFQs();
+        }
+      )
+      .subscribe();
+
     return () => {
       clearInterval(timer);
-      supabase.removeChannel(channel);
+      supabase.removeChannel(bidsChannel);
+      supabase.removeChannel(rfqsChannel);
     };
   }, []);
 
@@ -84,11 +108,10 @@ export default function VendorDashboard() {
     setBidsByRfq(grouped);
   }
 
-  function getTimeRemaining(endTime: string) {
-    const diff =
-      new Date(endTime).getTime() - new Date().getTime();
+  function getTimeRemaining(rfq: RFQ) {
+    if (!isAuctionActive(rfq)) return "Auction Closed";
 
-    if (diff <= 0) return "Auction Closed";
+    const diff = new Date(rfq.ends_at).getTime() - new Date().getTime();
 
     const minutes = Math.floor(diff / 1000 / 60);
     const seconds = Math.floor((diff / 1000) % 60);
@@ -115,30 +138,33 @@ export default function VendorDashboard() {
     return { rank, total: bids.length };
   }
 
-  async function submitBid(rfqId: string, endTime: string) {
-    if (new Date(endTime) < new Date()) {
-      alert("Auction has already ended.");
+  async function submitBid(rfqId: string) {
+    const rfq = rfqs.find((r) => r.id === rfqId);
+
+    if (!rfq) {
+      alert("RFQ not found.");
+      return;
+    }
+
+    // Don't rely only on ends_at — check the full active/closed rule
+    // (status AND ends_at) before allowing a bid to be placed.
+    if (!isAuctionActive(rfq)) {
+      alert("Auction is closed.");
       return;
     }
 
     const vendorName = vendorNames[rfqId];
     const bidPrice = bidPrices[rfqId];
-    const rfq = rfqs.find((r) => r.id === rfqId);
-
-    if (!rfq) {
-    alert("RFQ not found.");
-    return;
-    }
-
-    if (Number(bidPrice) > rfq.max_price) {
-    alert(
-        `Your bid cannot be greater than the buyer's maximum price (₹${rfq.max_price}).`
-    );
-    return;
-    }
 
     if (!vendorName || !bidPrice) {
       alert("Please enter vendor name and bid.");
+      return;
+    }
+
+    if (Number(bidPrice) > rfq.max_price) {
+      alert(
+        `Your bid cannot be greater than the buyer's maximum price (₹${rfq.max_price}).`
+      );
       return;
     }
 
@@ -178,8 +204,8 @@ export default function VendorDashboard() {
 
         {rfqs.map((rfq) => {
 
-          const closed =
-            new Date(rfq.ends_at) < new Date();
+          const active = isAuctionActive(rfq);
+          const closed = !active;
 
           const myRank = getMyRank(rfq.id);
 
@@ -210,7 +236,7 @@ export default function VendorDashboard() {
               <p className="font-semibold">
                 Time Remaining:
                 {" "}
-                {getTimeRemaining(rfq.ends_at)}
+                {getTimeRemaining(rfq)}
               </p>
 
               <input
@@ -223,7 +249,7 @@ export default function VendorDashboard() {
                     [rfq.id]: e.target.value,
                   }))
                 }
-                disabled={closed}
+                disabled={!active}
               />
 
               <input
@@ -237,21 +263,21 @@ export default function VendorDashboard() {
                     [rfq.id]: e.target.value,
                   }))
                 }
-                disabled={closed}
+                disabled={!active}
               />
 
               <button
-                disabled={closed}
+                disabled={!active}
                 onClick={() =>
-                  submitBid(rfq.id, rfq.ends_at)
+                  submitBid(rfq.id)
                 }
                 className={`mt-5 w-full py-3 rounded-lg text-white ${
-                  closed
+                  !active
                     ? "bg-gray-400 cursor-not-allowed"
                     : "bg-blue-600 hover:bg-blue-700"
                 }`}
               >
-                {closed
+                {!active
                   ? "Auction Closed"
                   : "Submit Bid"}
               </button>

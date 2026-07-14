@@ -20,6 +20,16 @@ interface Bid {
   bid_price: number;
 }
 
+// Single source of truth for "is this auction still live".
+// Everywhere in this file that needs to know active/closed status
+// should call this instead of checking status or ends_at separately.
+function isAuctionActive(rfq: RFQ): boolean {
+  return (
+    rfq.status === "active" &&
+    new Date(rfq.ends_at).getTime() > Date.now()
+  );
+}
+
 export default function Dashboard() {
   const [material, setMaterial] = useState("");
   const [quantity, setQuantity] = useState("");
@@ -149,9 +159,12 @@ export default function Dashboard() {
   }
 
   async function closeAuction(id: string) {
+    // Manual close must behave exactly like a natural expiry: set status to
+    // "closed" AND pull ends_at back to now, so isAuctionActive() (which
+    // checks both fields) immediately reports false everywhere it's used.
     const { error } = await supabase
       .from("rfqs")
-      .update({ status: "closed" })
+      .update({ status: "closed", ends_at: new Date().toISOString() })
       .eq("id", id)
       .eq("status", "active");
 
@@ -208,14 +221,14 @@ export default function Dashboard() {
           <div className="bg-white rounded-xl shadow p-5">
             <p className="text-gray-500 text-sm">Active Auctions</p>
             <h2 className="text-4xl font-bold text-green-600">
-              {rfqs.filter((r) => r.status === "active").length}
+              {rfqs.filter(isAuctionActive).length}
             </h2>
           </div>
 
           <div className="bg-white rounded-xl shadow p-5">
             <p className="text-gray-500 text-sm">Completed Auctions</p>
             <h2 className="text-4xl font-bold text-red-600">
-              {rfqs.filter((r) => r.status === "closed").length}
+              {rfqs.filter((r) => !isAuctionActive(r)).length}
             </h2>
           </div>
 
@@ -323,29 +336,47 @@ function AuctionCard({
   );
 
   useEffect(() => {
+    // If the auction is already not active (closed manually, or ends_at is
+    // already in the past), don't start a timer at all — just show 0 and stop.
+    if (!isAuctionActive(rfq)) {
+      setRemainingMs(0);
+      return;
+    }
+
     const target = new Date(rfq.ends_at).getTime();
 
-    const interval = setInterval(() => {
+    const tick = () => {
       const remaining = Math.max(0, target - Date.now());
       setRemainingMs(remaining);
+      return remaining;
+    };
 
-      if (remaining === 0 && rfq.status === "active") {
+    // Run an immediate check in case the auction already expired between
+    // renders, so we don't wait a full second to notice.
+    if (tick() === 0) {
+      onAutoClose();
+      return;
+    }
+
+    const interval = setInterval(() => {
+      const remaining = tick();
+      if (remaining === 0) {
+        clearInterval(interval);
         onAutoClose();
       }
     }, 1000);
 
+    // Clear the interval on unmount AND whenever rfq.status/ends_at change
+    // (e.g. after a manual close updates the row), so no stale timer keeps
+    // running in the background.
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rfq.ends_at, rfq.status]);
 
-  // Treat the auction as active only if the DB says so AND the timer hasn't
-  // actually run out yet. This keeps the buyer dashboard's Live/Closed status
-  // (and the winner reveal) in sync with real elapsed time, instead of being
-  // stuck on a stale "active" status if the DB update/refresh is delayed.
-  const isActive = rfq.status === "active" && remainingMs > 0;
+  const isActive = isAuctionActive(rfq);
   const mins = Math.floor(remainingMs / 1000 / 60);
   const secs = Math.floor((remainingMs / 1000) % 60);
-  const timeLabel = remainingMs <= 0 ? "Auction Closed" : `${mins}m ${secs}s`;
+  const timeLabel = isActive ? `${mins}m ${secs}s` : "Auction Closed";
 
   return (
     <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
